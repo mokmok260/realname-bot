@@ -1,0 +1,11 @@
+{
+  "name": "realname-bot",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "node-telegram-bot-api": "^0.64.0"
+  }
+}
