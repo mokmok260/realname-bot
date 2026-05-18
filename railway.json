@@ -1,0 +1,19 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "nixpacks": {
+    "pkgs": ["chromium"],
+    "phases": {
+      "setup": {
+        "nixPkgs": ["chromium"]
+      },
+      "install": {
+        "cmds": ["npm install"]
+      },
+      "start": {
+        "cmd": "node index.js"
+      }
+    }
+  }
+}
