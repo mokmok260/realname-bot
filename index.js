@@ -162,7 +162,7 @@ async function startTask(loginType, chatId) {
     return;
   }
 
-  const browser = await chromium.launch({ headless: false });
+  const browser = await chromium.launch({ headless: true });
   currentBrowser = browser;
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -392,6 +392,7 @@ async function startTask(loginType, chatId) {
   await browser.close();
   currentBrowser = null;
 
+// 启动 HTTP 服务（Render 健康检查需要）
 const http = require('http');
 const server = http.createServer((req, res) => {
   res.writeHead(200);
