@@ -4,7 +4,8 @@
   "description": "Telegram bot for real-name verification",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
