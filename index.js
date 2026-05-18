@@ -62,7 +62,6 @@ async function waitTelegramReply(chatId, timeoutSeconds = 120) {
   });
 }
 
-// 检查页面是否包含“已满18周岁”（支持 iframe）
 async function isAlreadyVerified(page) {
   const bodyText = await page.textContent('body').catch(() => '');
   if (bodyText.includes('已满18周岁')) return true;
@@ -75,7 +74,6 @@ async function isAlreadyVerified(page) {
   return false;
 }
 
-// 截图并发送已实名通知
 async function handleAlreadyVerified(page, browser) {
   console.log('⚠️ 账号已实名');
   const screenshotPath = path.resolve(__dirname, 'already_verified.png');
@@ -86,7 +84,6 @@ async function handleAlreadyVerified(page, browser) {
   return true;
 }
 
-// 智能查找实名输入框和身份证输入框（支持多种选择器）
 async function findInputs(page) {
   const nameSelectors = ['#realname', '#real_name_ipt', 'input[name="realname"]', 'input[placeholder*="姓名"]'];
   const idSelectors = ['#idcard', '#card_id_ipt', 'input[name="idcard"]', 'input[placeholder*="身份证"]'];
@@ -179,7 +176,6 @@ async function startTask(loginType, chatId) {
   }
   await page.waitForTimeout(5000);
 
-  // 获取登录 iframe
   let frame;
   for (let i = 0; i < 10; i++) {
     if (loginType === '2') {
@@ -197,7 +193,6 @@ async function startTask(loginType, chatId) {
     return;
   }
 
-  // 获取二维码元素
   let qrElement = null;
   for (let attempt = 0; attempt < 30; attempt++) {
     if (loginType === '2') {
@@ -226,7 +221,6 @@ async function startTask(loginType, chatId) {
   await qrElement.screenshot({ path: qrPath });
   await sendToAll('photo', qrPath, { caption: '📱 请扫码登录' });
 
-  // 等待扫码（微信5分钟，QQ110秒）
   const expireTime = (loginType === '2') ? 110 * 1000 : 5 * 60 * 1000;
   const startTime = Date.now();
   let loggedIn = false;
@@ -259,19 +253,16 @@ async function startTask(loginType, chatId) {
   await page.waitForTimeout(5000);
   console.log('登录后等待页面稳定...');
 
-  // 再次检查已实名
   if (await isAlreadyVerified(page)) {
     await handleAlreadyVerified(page, browser);
     return;
   }
 
-  // 等待实名输入框出现（重点修改：使用智能选择器，并考虑 iframe）
   console.log('查找实名输入框...');
   let nameInput = null;
   let idInput = null;
-
-  // 首先在主页面查找
   let found = false;
+
   for (let retry = 0; retry < 20; retry++) {
     const inputs = await findInputs(page);
     nameInput = inputs.nameInput;
@@ -280,7 +271,6 @@ async function startTask(loginType, chatId) {
       found = true;
       break;
     }
-    // 如果在主页面找不到，尝试在所有 iframe 中查找
     for (const f of page.frames()) {
       const iframeInputs = await findInputs(f);
       if (iframeInputs.nameInput && iframeInputs.idInput) {
@@ -306,7 +296,6 @@ async function startTask(loginType, chatId) {
   console.log('找到实名输入框，开始填写');
   await sendToAll('message', '✅ 已进入实名页面，开始自动填写');
 
-  // 实名循环
   let failCount = 0;
   let totalTry = 0;
 
@@ -319,7 +308,6 @@ async function startTask(loginType, chatId) {
     console.log(`尝试 ${totalTry}: ${realName} ${idCard}`);
 
     try {
-      // 清空并填写（注意可能跨 frame，需要重新获取元素）
       let curNameInput = nameInput;
       let curIdInput = idInput;
       if (!curNameInput || !curIdInput) {
@@ -336,13 +324,12 @@ async function startTask(loginType, chatId) {
       await curIdInput.fill(idCard);
       await page.waitForTimeout(1500);
 
-      // 勾选协议
       const agreeCheckbox = await page.$('#rule_check, input[type="checkbox"]');
       if (agreeCheckbox) {
         const isChecked = await agreeCheckbox.isChecked();
         if (!isChecked) await agreeCheckbox.click();
       }
-      // 提交按钮
+
       const submitBtn = await page.$('#submit_info, button[type="submit"], input[value="提交"]');
       if (!submitBtn) throw new Error('找不到提交按钮');
       await submitBtn.click();
@@ -352,7 +339,6 @@ async function startTask(loginType, chatId) {
       await page.screenshot({ path: screenshotPath, fullPage: true });
       await sendToAll('photo', screenshotPath, { caption: '实名结果' });
 
-      // 检查是否成功（实名输入框消失或出现成功提示）
       const stillHasInput = await findInputs(page);
       if (!stillHasInput.nameInput && !stillHasInput.idInput) {
         await sendToAll('message', `✅ 实名成功\n${realName}\n${idCard}`);
@@ -361,7 +347,6 @@ async function startTask(loginType, chatId) {
         fs.writeFileSync('data.json', JSON.stringify(data, null, 2));
         break;
       } else {
-        // 异常处理
         await sendToAll('message', '⚠️ 异常，请回复 c(继续) n(下一条) q(退出)');
         const ans = await waitTelegramReply(chatId, 120);
         if (ans === 'q') break;
@@ -391,8 +376,9 @@ async function startTask(loginType, chatId) {
   taskStatus = '空闲';
   await browser.close();
   currentBrowser = null;
+}
 
-// 启动 HTTP 服务（Render 健康检查需要）
+// ========== HTTP 服务（Railway 健康检查需要）==========
 const http = require('http');
 const server = http.createServer((req, res) => {
   res.writeHead(200);
@@ -402,5 +388,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`HTTP 服务运行在端口 ${PORT}`);
 });
-
-}
