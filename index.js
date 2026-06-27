@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// bot.js - 中文版，修复成功判断逻辑
+// bot.js - 中文版，安全写入 success.txt
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -213,50 +213,20 @@ async function handlePopup(page) {
   }
 }
 
-// ***** 修复后的成功检测函数 *****
-// 优先检测成功关键词，再检测错误关键词
+// ========== 核心成功判断函数 ==========
+// 返回值：true=成功，false=失败，null=不确定（需要人工确认）
 async function isVerificationSuccess(page) {
   try {
-    // 1. 首先检查成功关键词（主页面和所有iframe）
-    const successKeywords = ['实名认证成功', '实名成功', '认证通过'];
-    
-    // 先检查特定成功元素（更精确）
-    const successSelectors = ['#result_msg', '.tip-success', '.success-tip', '#success_msg'];
-    for (const sel of successSelectors) {
-      const el = await findInFrames(page, sel);
-      if (el) {
-        const text = await el.textContent().catch(() => '');
-        for (const kw of successKeywords) {
-          if (text.includes(kw)) {
-            console.log('✅ 在成功元素中检测到成功关键词:', kw);
-            return true;
-          }
-        }
-      }
+    // 1. 检查输入框是否还存在（主页面和所有iframe）
+    const inputsExist = await hasInputs(page);
+    if (!inputsExist) {
+      console.log('✅ 输入框已消失，判定为成功。');
+      return true;
     }
 
-    // 再检查整个页面内容（主页面）
-    let bodyText = await page.textContent('body').catch(() => '');
-    for (const kw of successKeywords) {
-      if (bodyText.includes(kw)) {
-        console.log('✅ 在主页面检测到成功关键词:', kw);
-        return true;
-      }
-    }
-    // 检查所有iframe
-    for (const f of page.frames()) {
-      const text = await f.textContent('body').catch(() => '');
-      for (const kw of successKeywords) {
-        if (text.includes(kw)) {
-          console.log('✅ 在iframe中检测到成功关键词:', kw);
-          return true;
-        }
-      }
-    }
-
-    // 2. 如果没有成功关键词，再检查错误关键词（辅助判断）
+    // 2. 输入框还在 → 检查是否有明确错误提示
     const errorKeywords = ['系统繁忙', '网络异常', '错误', '重新登录', '失败'];
-    bodyText = await page.textContent('body').catch(() => '');
+    let bodyText = await page.textContent('body').catch(() => '');
     for (const kw of errorKeywords) {
       if (bodyText.includes(kw)) {
         console.log('❌ 检测到错误关键词:', kw);
@@ -273,12 +243,12 @@ async function isVerificationSuccess(page) {
       }
     }
 
-    // 3. 如果既无成功也无错误关键词，保守返回false（避免误判）
-    console.log('⚠️ 未检测到明确成功或失败关键词，视为失败。');
-    return false;
+    // 3. 输入框还在且无明确错误 → 不确定
+    console.log('⚠️ 输入框还在且无明显错误，状态不确定，等待人工确认。');
+    return null;
   } catch (e) {
-    console.error('检查成功状态出错:', e.message);
-    return false;
+    console.error('检查状态出错:', e.message);
+    return null;
   }
 }
 
@@ -469,16 +439,23 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
         await page.screenshot({ path: screenshotPath, fullPage: true });
         await sendPhotoToChat(chatId, screenshotPath, { caption: `任务 ${taskId} 执行结果` });
 
-        const success = await isVerificationSuccess(page);
-        if (success) {
+        const result = await isVerificationSuccess(page);
+
+        if (result === true) {
+          // ========== 明确成功，写入 success.txt（安全方式） ==========
+          const oldSuccess = fs.existsSync(SUCCESS_FILE)
+            ? fs.readFileSync(SUCCESS_FILE, 'utf8')
+            : '';
+          atomicWriteFile(SUCCESS_FILE, oldSuccess + `${realName}|${idCard}\n`);
+
           const masked = maskId(idCard);
           await sendToChat(chatId, `✅ 任务 ${taskId} 实名成功\n${realName} | ${masked}`);
-          atomicWriteFile(SUCCESS_FILE, fs.readFileSync(SUCCESS_FILE, 'utf8') + `${realName}|${idCard}\n`);
           data.shift();
           atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
           break;
-        } else {
-          await sendToChat(chatId, '⚠️ 实名失败（未检测到成功文字）。回复 c(继续) n(下一条) q(退出)');
+        } else if (result === false) {
+          // 明确失败
+          await sendToChat(chatId, '⚠️ 实名失败（检测到错误提示）。回复 c(继续) n(下一条) q(退出)');
           const ans = await waitTelegramReply(chatId, abortSignal, 120);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
           if (ans === 'q') { normalCompletion = false; return; }
@@ -488,6 +465,35 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
             failCount++;
           } else if (ans === 'c') {
             await handlePopup(page);
+          }
+        } else { // null 不确定
+          await sendToChat(chatId, '⚠️ 系统无法自动判断结果，请查看截图并回复 y(成功) / n(失败)');
+          const ans = await waitTelegramReply(chatId, abortSignal, 60);
+          if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
+          if (ans === 'y') {
+            // ========== 人工确认成功，写入 success.txt（安全方式） ==========
+            const oldSuccess = fs.existsSync(SUCCESS_FILE)
+              ? fs.readFileSync(SUCCESS_FILE, 'utf8')
+              : '';
+            atomicWriteFile(SUCCESS_FILE, oldSuccess + `${realName}|${idCard}\n`);
+
+            const masked = maskId(idCard);
+            await sendToChat(chatId, `✅ 任务 ${taskId} 实名成功（人工确认）\n${realName} | ${masked}`);
+            data.shift();
+            atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+            break;
+          } else {
+            await sendToChat(chatId, '人工判定为失败。回复 c(继续) n(下一条) q(退出)');
+            const ans2 = await waitTelegramReply(chatId, abortSignal, 120);
+            if (abortSignal.aborted || ans2 === null) { normalCompletion = false; return; }
+            if (ans2 === 'q') { normalCompletion = false; return; }
+            if (ans2 === 'n') {
+              data.shift();
+              atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+              failCount++;
+            } else if (ans2 === 'c') {
+              await handlePopup(page);
+            }
           }
         }
 
