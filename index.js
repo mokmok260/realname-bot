@@ -46,8 +46,7 @@ function atomicWriteFile(filePath, data) {
 }
 
 function maskId(id) {
-  if (!id || id.length < 10) return '****';
-  return id.substring(0, 6) + '********' + id.substring(id.length - 4);
+  return id;  // 直接返回完整身份证号
 }
 
 async function sendToChat(chatId, content, options = {}) {
