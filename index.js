@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// bot.js - 中文版，安全写入 success.txt
+// bot.js - 完整版，含 /add 命令显示
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -23,6 +23,8 @@ const HEADLESS = process.env.HEADLESS === 'true';
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 const SUCCESS_FILE = path.join(__dirname, 'success.txt');
+const FAILED_FILE = path.join(__dirname, 'failed.txt');
+const REVIEW_FILE = path.join(__dirname, 'pending_review.txt');
 const TEMP_SUFFIX = '.tmp';
 
 // ========== 全局状态 ==========
@@ -46,7 +48,7 @@ function atomicWriteFile(filePath, data) {
 }
 
 function maskId(id) {
-  return id;  // 直接返回完整身份证号
+  return id;  // 显示完整身份证号
 }
 
 async function sendToChat(chatId, content, options = {}) {
@@ -121,6 +123,65 @@ async function isAlreadyVerified(page) {
     } catch (e) {}
   }
   return false;
+}
+
+async function isUnderManualReview(page) {
+  const keywords = ['人工实名审核中', '提交人工实名认证', '审核中'];
+  let bodyText = await page.textContent('body').catch(() => '');
+  for (const kw of keywords) {
+    if (bodyText.includes(kw)) {
+      console.log(`🔍 检测到审核状态关键词: ${kw}`);
+      return true;
+    }
+  }
+  for (const f of page.frames()) {
+    const text = await f.textContent('body').catch(() => '');
+    for (const kw of keywords) {
+      if (text.includes(kw)) {
+        console.log(`🔍 在iframe中检测到审核状态关键词: ${kw}`);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function handleManualReview(page, taskId, realName, idCard, chatId) {
+  console.log(`📋 任务 ${taskId}: 进入人工审核状态`);
+  const screenshotPath = path.join(__dirname, `manual_review_${taskId}_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+  
+  await sendPhotoToChat(chatId, screenshotPath, { 
+    caption: `📋 【人工审核中】\n姓名：${realName}\n身份证：${maskId(idCard)}\n\n该资料已提交人工审核，请等待结果。` 
+  });
+  await broadcastPhoto(screenshotPath);
+  await broadcastMessage(`📋 人工审核状态\n姓名：${realName}\n身份证：${maskId(idCard)}\n任务 ${taskId} 已提交人工审核。`);
+  
+  const oldReview = fs.existsSync(REVIEW_FILE)
+    ? fs.readFileSync(REVIEW_FILE, 'utf8')
+    : '';
+  atomicWriteFile(REVIEW_FILE, oldReview + `${realName}|${idCard}|${new Date().toISOString()}\n`);
+  
+  return true;
+}
+
+async function handleFailure(page, taskId, realName, idCard, chatId, reason) {
+  console.log(`❌ 任务 ${taskId}: 实名失败 - ${reason}`);
+  const screenshotPath = path.join(__dirname, `failed_${taskId}_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+  
+  await sendPhotoToChat(chatId, screenshotPath, { 
+    caption: `❌ 【实名失败】\n姓名：${realName}\n身份证：${maskId(idCard)}\n失败原因：${reason}\n时间：${new Date().toLocaleString()}` 
+  });
+  await broadcastPhoto(screenshotPath);
+  await broadcastMessage(`❌ 实名失败\n姓名：${realName}\n身份证：${maskId(idCard)}\n失败原因：${reason}`);
+  
+  const oldFailed = fs.existsSync(FAILED_FILE)
+    ? fs.readFileSync(FAILED_FILE, 'utf8')
+    : '';
+  atomicWriteFile(FAILED_FILE, oldFailed + `${realName}|${idCard}|${reason}|${new Date().toISOString()}\n`);
+  
+  return true;
 }
 
 async function handleAlreadyVerified(page, browser) {
@@ -212,24 +273,24 @@ async function handlePopup(page) {
   }
 }
 
-// ========== 核心成功判断函数 ==========
-// 返回值：true=成功，false=失败，null=不确定（需要人工确认）
-async function isVerificationSuccess(page) {
+async function checkVerificationStatus(page) {
   try {
-    // 1. 检查输入框是否还存在（主页面和所有iframe）
+    if (await isUnderManualReview(page)) {
+      return { result: 'review', reason: '人工审核中' };
+    }
+    
     const inputsExist = await hasInputs(page);
     if (!inputsExist) {
       console.log('✅ 输入框已消失，判定为成功。');
-      return true;
+      return { result: 'success', reason: '输入框消失' };
     }
 
-    // 2. 输入框还在 → 检查是否有明确错误提示
-    const errorKeywords = ['系统繁忙', '网络异常', '错误', '重新登录', '失败'];
+    const errorKeywords = ['系统繁忙', '网络异常', '错误', '重新登录', '失败', '请稍后再试'];
     let bodyText = await page.textContent('body').catch(() => '');
     for (const kw of errorKeywords) {
       if (bodyText.includes(kw)) {
         console.log('❌ 检测到错误关键词:', kw);
-        return false;
+        return { result: 'failed', reason: `检测到错误提示: ${kw}` };
       }
     }
     for (const f of page.frames()) {
@@ -237,17 +298,16 @@ async function isVerificationSuccess(page) {
       for (const kw of errorKeywords) {
         if (text.includes(kw)) {
           console.log('❌ 在iframe中检测到错误关键词:', kw);
-          return false;
+          return { result: 'failed', reason: `检测到错误提示: ${kw}` };
         }
       }
     }
 
-    // 3. 输入框还在且无明确错误 → 不确定
-    console.log('⚠️ 输入框还在且无明显错误，状态不确定，等待人工确认。');
-    return null;
+    console.log('⚠️ 状态不确定，等待人工确认。');
+    return { result: 'unknown', reason: '无法自动判断' };
   } catch (e) {
     console.error('检查状态出错:', e.message);
-    return null;
+    return { result: 'unknown', reason: `检查出错: ${e.message}` };
   }
 }
 
@@ -438,23 +498,31 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
         await page.screenshot({ path: screenshotPath, fullPage: true });
         await sendPhotoToChat(chatId, screenshotPath, { caption: `任务 ${taskId} 执行结果` });
 
-        const result = await isVerificationSuccess(page);
+        const status = await checkVerificationStatus(page);
 
-        if (result === true) {
-          // ========== 明确成功，写入 success.txt（安全方式） ==========
+        if (status.result === 'success') {
           const oldSuccess = fs.existsSync(SUCCESS_FILE)
             ? fs.readFileSync(SUCCESS_FILE, 'utf8')
             : '';
-          atomicWriteFile(SUCCESS_FILE, oldSuccess + `${realName}|${idCard}\n`);
+          atomicWriteFile(SUCCESS_FILE, oldSuccess + `${realName}|${idCard}|${new Date().toISOString()}\n`);
 
           const masked = maskId(idCard);
           await sendToChat(chatId, `✅ 任务 ${taskId} 实名成功\n${realName} | ${masked}`);
           data.shift();
           atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
           break;
-        } else if (result === false) {
-          // 明确失败
-          await sendToChat(chatId, '⚠️ 实名失败（检测到错误提示）。回复 c(继续) n(下一条) q(退出)');
+          
+        } else if (status.result === 'review') {
+          await handleManualReview(page, taskId, realName, idCard, chatId);
+          data.shift();
+          atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+          failCount = 0;
+          break;
+          
+        } else if (status.result === 'failed') {
+          await handleFailure(page, taskId, realName, idCard, chatId, status.reason);
+          
+          await sendToChat(chatId, `⚠️ 实名失败。回复 c(继续) n(下一条) q(退出)`);
           const ans = await waitTelegramReply(chatId, abortSignal, 120);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
           if (ans === 'q') { normalCompletion = false; return; }
@@ -465,23 +533,32 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           } else if (ans === 'c') {
             await handlePopup(page);
           }
-        } else { // null 不确定
-          await sendToChat(chatId, '⚠️ 系统无法自动判断结果，请查看截图并回复 y(成功) / n(失败)');
+          
+        } else {
+          await sendToChat(chatId, '⚠️ 系统无法自动判断结果，请查看截图并回复 y(成功) / n(失败) / r(审核中)');
           const ans = await waitTelegramReply(chatId, abortSignal, 60);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
+          
           if (ans === 'y') {
-            // ========== 人工确认成功，写入 success.txt（安全方式） ==========
             const oldSuccess = fs.existsSync(SUCCESS_FILE)
               ? fs.readFileSync(SUCCESS_FILE, 'utf8')
               : '';
-            atomicWriteFile(SUCCESS_FILE, oldSuccess + `${realName}|${idCard}\n`);
+            atomicWriteFile(SUCCESS_FILE, oldSuccess + `${realName}|${idCard}|${new Date().toISOString()}\n`);
 
             const masked = maskId(idCard);
             await sendToChat(chatId, `✅ 任务 ${taskId} 实名成功（人工确认）\n${realName} | ${masked}`);
             data.shift();
             atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
             break;
+          } else if (ans === 'r') {
+            await handleManualReview(page, taskId, realName, idCard, chatId);
+            data.shift();
+            atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+            failCount = 0;
+            break;
           } else {
+            await handleFailure(page, taskId, realName, idCard, chatId, '人工判定为失败');
+            
             await sendToChat(chatId, '人工判定为失败。回复 c(继续) n(下一条) q(退出)');
             const ans2 = await waitTelegramReply(chatId, abortSignal, 120);
             if (abortSignal.aborted || ans2 === null) { normalCompletion = false; return; }
@@ -575,6 +652,52 @@ bot.on('message', async (msg) => {
   }
 
   // ---------- 命令处理 ----------
+  // /add 命令
+  if (text.startsWith('/add ')) {
+    if (isTaskRunning) {
+      await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再添加。');
+      return;
+    }
+    try {
+      const parts = text.split(' ');
+      if (parts.length < 3) {
+        await sendToChat(chatId, '⚠️ 格式错误，请使用：/add 姓名 身份证号\n例如：/add 王五 110101199001011234');
+        return;
+      }
+      const name = parts[1];
+      const idCard = parts.slice(2).join('');
+      if (!/^\d{17}[\dXx]$/.test(idCard)) {
+        await sendToChat(chatId, '⚠️ 身份证号格式错误，请输入18位数字（最后一位可为X）');
+        return;
+      }
+
+      let data = [];
+      if (fs.existsSync(DATA_FILE)) {
+        try {
+          data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        } catch (e) {
+          data = [];
+        }
+      }
+
+      const exists = data.some(item => item.id === idCard);
+      if (exists) {
+        await sendToChat(chatId, `⚠️ 身份证号 ${maskId(idCard)} 已存在，请勿重复添加。`);
+        return;
+      }
+
+      data.push({ name: name, id: idCard });
+      atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+
+      await sendToChat(chatId, `✅ 已添加资料\n姓名：${name}\n身份证：${maskId(idCard)}\n当前队列共 ${data.length} 条`);
+    } catch (e) {
+      console.error('添加资料失败:', e);
+      await sendToChat(chatId, `❌ 添加失败: ${e.message}`);
+    }
+    return;
+  }
+
+  // /list 命令
   if (text === '/list' || text.startsWith('/list ')) {
     try {
       let page = 1;
@@ -593,7 +716,7 @@ bot.on('message', async (msg) => {
         const maskedId = maskId(item.id);
         message += `【${i+1}】${item.name} | ${maskedId}\n`;
       }
-      message += `━━━━━━━━━━━━━━━\n💡 使用 /del 序号 删除，如 /del 5`;
+      message += `━━━━━━━━━━━━━━━\n💡 使用 /add 姓名 身份证 添加资料\n💡 使用 /del 序号 删除资料`;
       await sendToChat(chatId, message);
     } catch (e) {
       await sendToChat(chatId, `❌ 读取资料失败: ${e.message}`);
@@ -601,6 +724,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // /del 命令
   if (text.startsWith('/del ')) {
     if (isTaskRunning) {
       await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再删除。');
@@ -629,6 +753,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // /starttask 命令
   if (text === '/starttask') {
     if (isTaskRunning) {
       await sendToChat(chatId, `⚠️ 任务 (ID ${currentTaskId}) 正在运行，请先 /cancel。`);
@@ -643,7 +768,8 @@ bot.on('message', async (msg) => {
     abortController = newAbortController;
     isTaskRunning = true;
 
-    await sendToChat(chatId, `启动任务 ${taskId}\n/cancel 停止\n/status 状态\n/queue 剩余\n/list 列表\n/del 删除\n\n任务中: c=继续, n=下一条, q=退出`);
+    // ===== 修复：这里加上 /add 命令 =====
+    await sendToChat(chatId, `启动任务 ${taskId}\n/cancel 停止\n/status 状态\n/queue 剩余\n/list 列表\n/add 添加\n/del 删除\n\n任务中: c=继续, n=下一条, q=退出`);
     await sendToChat(chatId, '请选择登录方式:\n1 = 微信\n2 = QQ');
 
     let loginType = null;
@@ -671,6 +797,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // /cancel 命令
   if (text === '/cancel') {
     if (!isTaskRunning || !abortController) {
       await sendToChat(chatId, '没有正在运行的任务。');
@@ -693,6 +820,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // /status 命令
   if (text === '/status') {
     if (isTaskRunning) {
       await sendToChat(chatId, `状态: 运行中 (任务 ${currentTaskId})`);
@@ -703,6 +831,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // /queue 命令
   if (text === '/queue') {
     try {
       const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -722,6 +851,7 @@ console.log('  /starttask - 启动实名任务');
 console.log('  /cancel   - 取消当前任务');
 console.log('  /status   - 查看任务状态');
 console.log('  /queue    - 查看剩余资料数量');
-console.log('  /list     - 查看资料列表（脱敏）');
+console.log('  /list     - 查看资料列表');
+console.log('  /add 姓名 身份证 - 添加资料');
 console.log('  /del 序号 - 删除指定资料');
-console.log('  任务中: c=继续, n=下一条, q=退出');
+console.log('  任务中: c=继续, n=下一条, q=退出, r=审核中');
