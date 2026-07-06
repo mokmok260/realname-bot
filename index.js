@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// bot.js - 完整版，含 /add 命令显示
+// bot.js - 完整版，含人工审核失败截图+重试
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -165,6 +165,38 @@ async function handleManualReview(page, taskId, realName, idCard, chatId) {
   return true;
 }
 
+// ========== 新增：处理人工审核失败（需人工介入） ==========
+async function handleManualFailure(page, taskId, realName, idCard, chatId, reason) {
+  console.log(`⚠️ 任务 ${taskId}: 人工审核失败 - ${reason}`);
+  const screenshotPath = path.join(__dirname, `manual_failure_${taskId}_${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+  
+  await sendPhotoToChat(chatId, screenshotPath, { 
+    caption: `⚠️ 【人工审核失败】\n姓名：${realName}\n身份证：${maskId(idCard)}\n失败原因：${reason}\n\n请回复 r 重试（点击实名认证按钮） / n 下一条 / q 退出`
+  });
+  await broadcastPhoto(screenshotPath);
+  await broadcastMessage(`⚠️ 人工审核失败\n姓名：${realName}\n身份证：${maskId(idCard)}\n原因：${reason}`);
+  
+  // 等待用户决策（重试或跳过）
+  const ans = await waitTelegramReply(chatId, abortController.signal, 120);
+  if (abortController?.signal?.aborted || ans === null) {
+    return 'abort';
+  }
+  if (ans === 'r') {
+    // 用户选择重试：点击“实名认证”按钮
+    return 'retry';
+  } else if (ans === 'n') {
+    return 'skip';
+  } else if (ans === 'q') {
+    return 'quit';
+  } else {
+    // 无效输入，提示后重新等待（递归处理？简单起见，返回 skip）
+    await sendToChat(chatId, '输入无效，默认跳过。');
+    return 'skip';
+  }
+}
+
+// 处理普通失败（错误提示）
 async function handleFailure(page, taskId, realName, idCard, chatId, reason) {
   console.log(`❌ 任务 ${taskId}: 实名失败 - ${reason}`);
   const screenshotPath = path.join(__dirname, `failed_${taskId}_${Date.now()}.png`);
@@ -275,18 +307,40 @@ async function handlePopup(page) {
 
 async function checkVerificationStatus(page) {
   try {
+    // 1. 检查人工审核中
     if (await isUnderManualReview(page)) {
       return { result: 'review', reason: '人工审核中' };
     }
     
+    // 2. 检查人工审核失败（需人工介入）
+    const manualFailKeywords = ['人工实名审核失败', '暂不支持', '护照以外证件', '重新提交护照'];
+    let bodyText = await page.textContent('body').catch(() => '');
+    for (const kw of manualFailKeywords) {
+      if (bodyText.includes(kw)) {
+        console.log('🔍 检测到人工审核失败关键词:', kw);
+        return { result: 'manual_failure', reason: '人工审核失败，需人工处理' };
+      }
+    }
+    for (const f of page.frames()) {
+      const text = await f.textContent('body').catch(() => '');
+      for (const kw of manualFailKeywords) {
+        if (text.includes(kw)) {
+          console.log('🔍 在iframe中检测到人工审核失败关键词:', kw);
+          return { result: 'manual_failure', reason: '人工审核失败，需人工处理' };
+        }
+      }
+    }
+
+    // 3. 检查输入框是否消失
     const inputsExist = await hasInputs(page);
     if (!inputsExist) {
       console.log('✅ 输入框已消失，判定为成功。');
       return { result: 'success', reason: '输入框消失' };
     }
 
+    // 4. 检查错误关键词
     const errorKeywords = ['系统繁忙', '网络异常', '错误', '重新登录', '失败', '请稍后再试'];
-    let bodyText = await page.textContent('body').catch(() => '');
+    bodyText = await page.textContent('body').catch(() => '');
     for (const kw of errorKeywords) {
       if (bodyText.includes(kw)) {
         console.log('❌ 检测到错误关键词:', kw);
@@ -303,6 +357,7 @@ async function checkVerificationStatus(page) {
       }
     }
 
+    // 5. 不确定
     console.log('⚠️ 状态不确定，等待人工确认。');
     return { result: 'unknown', reason: '无法自动判断' };
   } catch (e) {
@@ -466,6 +521,7 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
       console.log(`任务 ${taskId} 第 ${totalTry} 次尝试: ${realName}`);
 
       try {
+        // 获取输入框并填充
         let curNameInput = null, curIdInput = null;
         for (let retry = 0; retry < 5; retry++) {
           const inputs = await findInputsInAllFrames(page);
@@ -494,13 +550,17 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
         await submitBtn.click();
         await delay(5000);
 
+        // 截图保存结果
         const screenshotPath = path.join(__dirname, `result_${taskId}_${totalTry}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
         await sendPhotoToChat(chatId, screenshotPath, { caption: `任务 ${taskId} 执行结果` });
 
+        // 检查状态
         const status = await checkVerificationStatus(page);
 
+        // ----- 处理各种结果 -----
         if (status.result === 'success') {
+          // 成功
           const oldSuccess = fs.existsSync(SUCCESS_FILE)
             ? fs.readFileSync(SUCCESS_FILE, 'utf8')
             : '';
@@ -513,13 +573,43 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           break;
           
         } else if (status.result === 'review') {
+          // 人工审核中
           await handleManualReview(page, taskId, realName, idCard, chatId);
           data.shift();
           atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
           failCount = 0;
           break;
           
+        } else if (status.result === 'manual_failure') {
+          // ========== 人工审核失败（需人工介入） ==========
+          const action = await handleManualFailure(page, taskId, realName, idCard, chatId, status.reason);
+          if (action === 'abort' || action === 'quit') {
+            normalCompletion = false;
+            break;
+          } else if (action === 'skip') {
+            data.shift();
+            atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+            failCount++;
+            continue; // 处理下一条
+          } else if (action === 'retry') {
+            // 用户选择重试：点击“实名认证”按钮
+            const retryBtn = await findButtonByText(page, '实名认证');
+            if (retryBtn) {
+              await retryBtn.click();
+              await delay(3000); // 等待页面刷新，可能回到填写表单
+              // 不删除当前资料，继续循环（重新填写提交）
+              continue;
+            } else {
+              await sendToChat(chatId, '⚠️ 找不到“实名认证”按钮，跳过该资料。');
+              data.shift();
+              atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+              failCount++;
+              continue;
+            }
+          }
+          
         } else if (status.result === 'failed') {
+          // 普通失败
           await handleFailure(page, taskId, realName, idCard, chatId, status.reason);
           
           await sendToChat(chatId, `⚠️ 实名失败。回复 c(继续) n(下一条) q(退出)`);
@@ -534,7 +624,8 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
             await handlePopup(page);
           }
           
-        } else {
+        } else { // unknown
+          // 不确定，人工判断
           await sendToChat(chatId, '⚠️ 系统无法自动判断结果，请查看截图并回复 y(成功) / n(失败) / r(审核中)');
           const ans = await waitTelegramReply(chatId, abortSignal, 60);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
@@ -557,6 +648,7 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
             failCount = 0;
             break;
           } else {
+            // 默认失败
             await handleFailure(page, taskId, realName, idCard, chatId, '人工判定为失败');
             
             await sendToChat(chatId, '人工判定为失败。回复 c(继续) n(下一条) q(退出)');
@@ -573,6 +665,7 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           }
         }
 
+        // 连续失败5次提示
         if (failCount >= 5) {
           await sendToChat(chatId, '连续失败5次。y(继续) / q(退出)');
           const ans = await waitTelegramReply(chatId, abortSignal, 60);
@@ -652,7 +745,7 @@ bot.on('message', async (msg) => {
   }
 
   // ---------- 命令处理 ----------
-  // /add 命令
+  // /add
   if (text.startsWith('/add ')) {
     if (isTaskRunning) {
       await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再添加。');
@@ -697,7 +790,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // /list 命令
+  // /list
   if (text === '/list' || text.startsWith('/list ')) {
     try {
       let page = 1;
@@ -724,7 +817,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // /del 命令
+  // /del
   if (text.startsWith('/del ')) {
     if (isTaskRunning) {
       await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再删除。');
@@ -753,7 +846,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // /starttask 命令
+  // /starttask
   if (text === '/starttask') {
     if (isTaskRunning) {
       await sendToChat(chatId, `⚠️ 任务 (ID ${currentTaskId}) 正在运行，请先 /cancel。`);
@@ -768,8 +861,7 @@ bot.on('message', async (msg) => {
     abortController = newAbortController;
     isTaskRunning = true;
 
-    // ===== 修复：这里加上 /add 命令 =====
-    await sendToChat(chatId, `启动任务 ${taskId}\n/cancel 停止\n/status 状态\n/queue 剩余\n/list 列表\n/add 添加\n/del 删除\n\n任务中: c=继续, n=下一条, q=退出`);
+    await sendToChat(chatId, `启动任务 ${taskId}\n/cancel 停止\n/status 状态\n/queue 剩余\n/list 列表\n/add 添加\n/del 删除\n\n任务中: c=继续, n=下一条, q=退出, r=重试`);
     await sendToChat(chatId, '请选择登录方式:\n1 = 微信\n2 = QQ');
 
     let loginType = null;
@@ -797,7 +889,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // /cancel 命令
+  // /cancel
   if (text === '/cancel') {
     if (!isTaskRunning || !abortController) {
       await sendToChat(chatId, '没有正在运行的任务。');
@@ -820,7 +912,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // /status 命令
+  // /status
   if (text === '/status') {
     if (isTaskRunning) {
       await sendToChat(chatId, `状态: 运行中 (任务 ${currentTaskId})`);
@@ -831,7 +923,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // /queue 命令
+  // /queue
   if (text === '/queue') {
     try {
       const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -854,4 +946,4 @@ console.log('  /queue    - 查看剩余资料数量');
 console.log('  /list     - 查看资料列表');
 console.log('  /add 姓名 身份证 - 添加资料');
 console.log('  /del 序号 - 删除指定资料');
-console.log('  任务中: c=继续, n=下一条, q=退出, r=审核中');
+console.log('  任务中: c=继续, n=下一条, q=退出, r=重试');
