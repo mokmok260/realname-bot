@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// bot.js - 带内联键盘，点击即可回复
+// bot.js - 完整版，带内联键盘、截图、人工审核失败重试
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -49,7 +49,7 @@ function atomicWriteFile(filePath, data) {
 }
 
 function maskId(id) {
-  return id;
+  return id; // 显示完整身份证号
 }
 
 async function sendToChat(chatId, content, options = {}) {
@@ -100,7 +100,6 @@ function createInlineKeyboard(buttons, columns = 2) {
   return { reply_markup: { inline_keyboard: keyboard } };
 }
 
-// 登录方式选择键盘
 function loginKeyboard() {
   return createInlineKeyboard([
     { text: '📱 微信', callback_data: 'login_1' },
@@ -108,7 +107,6 @@ function loginKeyboard() {
   ]);
 }
 
-// 通用选择键盘：继续 / 下一条 / 退出
 function continueKeyboard() {
   return createInlineKeyboard([
     { text: '🔄 继续 (c)', callback_data: 'choice_c' },
@@ -117,7 +115,6 @@ function continueKeyboard() {
   ]);
 }
 
-// 人工审核失败键盘：重试 / 下一条 / 退出
 function retryKeyboard() {
   return createInlineKeyboard([
     { text: '🔄 重试 (r)', callback_data: 'choice_r' },
@@ -126,7 +123,6 @@ function retryKeyboard() {
   ]);
 }
 
-// 不确定状态键盘：成功 / 失败 / 审核中
 function unknownKeyboard() {
   return createInlineKeyboard([
     { text: '✅ 成功 (y)', callback_data: 'choice_y' },
@@ -135,7 +131,6 @@ function unknownKeyboard() {
   ]);
 }
 
-// 连续失败键盘：继续 / 退出
 function failKeyboard() {
   return createInlineKeyboard([
     { text: '🔄 继续 (y)', callback_data: 'choice_y' },
@@ -773,17 +768,14 @@ bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id.toString();
   const data = callbackQuery.data;
   
-  // 只处理授权用户
   if (!ALLOWED_IDS.includes(chatId)) {
     await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ 未授权' });
     return;
   }
 
-  // 处理登录选择
   if (data.startsWith('login_')) {
     const value = data.replace('login_', '');
     await bot.answerCallbackQuery(callbackQuery.id);
-    // 清除原有回复等待
     if (pendingReplies.has(chatId)) {
       const resolve = pendingReplies.get(chatId);
       pendingReplies.delete(chatId);
@@ -796,7 +788,6 @@ bot.on('callback_query', async (callbackQuery) => {
     return;
   }
 
-  // 处理选择回复 (c/n/q/r/y)
   if (data.startsWith('choice_')) {
     const value = data.replace('choice_', '');
     await bot.answerCallbackQuery(callbackQuery.id);
@@ -855,4 +846,188 @@ bot.on('message', async (msg) => {
       const name = parts[1];
       const idCard = parts.slice(2).join('');
       if (!/^\d{17}[\dXx]$/.test(idCard)) {
-        await send
+        await sendToChat(chatId, '⚠️ 身份证号格式错误，请输入18位数字（最后一位可为X）');
+        return;
+      }
+
+      let data = [];
+      if (fs.existsSync(DATA_FILE)) {
+        try {
+          data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        } catch (e) {
+          data = [];
+        }
+      }
+
+      const exists = data.some(item => item.id === idCard);
+      if (exists) {
+        await sendToChat(chatId, `⚠️ 身份证号 ${maskId(idCard)} 已存在，请勿重复添加。`);
+        return;
+      }
+
+      data.push({ name: name, id: idCard });
+      atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+
+      await sendToChat(chatId, `✅ 已添加资料\n姓名：${name}\n身份证：${maskId(idCard)}\n当前队列共 ${data.length} 条`);
+    } catch (e) {
+      console.error('添加资料失败:', e);
+      await sendToChat(chatId, `❌ 添加失败: ${e.message}`);
+    }
+    return;
+  }
+
+  if (text === '/list' || text.startsWith('/list ')) {
+    try {
+      let page = 1;
+      const parts = text.split(' ');
+      if (parts.length > 1 && /^\d+$/.test(parts[1])) page = parseInt(parts[1]);
+      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (data.length === 0) { await sendToChat(chatId, '📭 队列为空'); return; }
+      const pageSize = 10;
+      const totalPages = Math.ceil(data.length / pageSize);
+      if (page > totalPages) page = totalPages;
+      const start = (page - 1) * pageSize;
+      const end = Math.min(start + pageSize, data.length);
+      let message = `📋 资料列表 (第 ${page}/${totalPages} 页，共 ${data.length} 条)\n━━━━━━━━━━━━━━━\n`;
+      for (let i = start; i < end; i++) {
+        const item = data[i];
+        const maskedId = maskId(item.id);
+        message += `【${i+1}】${item.name} | ${maskedId}\n`;
+      }
+      message += `━━━━━━━━━━━━━━━\n💡 使用 /add 姓名 身份证 添加资料\n💡 使用 /del 序号 删除资料`;
+      await sendToChat(chatId, message);
+    } catch (e) {
+      await sendToChat(chatId, `❌ 读取资料失败: ${e.message}`);
+    }
+    return;
+  }
+
+  if (text.startsWith('/del ')) {
+    if (isTaskRunning) {
+      await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再删除。');
+      return;
+    }
+    try {
+      const parts = text.split(' ');
+      if (parts.length < 2 || !/^\d+$/.test(parts[1])) {
+        await sendToChat(chatId, '⚠️ 请输入有效数字，例如 /del 5');
+        return;
+      }
+      const index = parseInt(parts[1]) - 1;
+      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (index < 0 || index >= data.length) {
+        await sendToChat(chatId, `❌ 序号无效，共有 ${data.length} 条资料。`);
+        return;
+      }
+      const deleted = data[index];
+      data.splice(index, 1);
+      atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
+      const maskedId = maskId(deleted.id);
+      await sendToChat(chatId, `✅ 已删除: ${deleted.name} | ${maskedId}\n剩余: ${data.length} 条`);
+    } catch (e) {
+      await sendToChat(chatId, `❌ 删除失败: ${e.message}`);
+    }
+    return;
+  }
+
+  if (text === '/starttask') {
+    if (isTaskRunning) {
+      await sendToChat(chatId, `⚠️ 任务 (ID ${currentTaskId}) 正在运行，请先 /cancel。`);
+      return;
+    }
+
+    currentTry = 0;
+
+    const taskId = ++taskIdCounter;
+    currentTaskId = taskId;
+    const newAbortController = new AbortController();
+    abortController = newAbortController;
+    isTaskRunning = true;
+
+    await sendToChat(chatId, `启动任务 ${taskId}\n/cancel 停止\n/status 状态\n/queue 剩余\n/list 列表\n/add 添加\n/del 删除\n\n任务中: c=继续, n=下一条, q=退出, r=重试`);
+    await sendToChat(chatId, '请选择登录方式：', loginKeyboard());
+
+    let loginType = null;
+    while (loginType === null) {
+      const reply = await waitTelegramReply(chatId, newAbortController.signal, 60);
+      if (newAbortController.signal.aborted || reply === null) {
+        isTaskRunning = false;
+        abortController = null;
+        currentTaskId = 0;
+        return;
+      }
+      if (reply === '1' || reply === '2') {
+        loginType = reply;
+      } else {
+        await sendToChat(chatId, '输入无效，请点击下方按钮选择：', loginKeyboard());
+      }
+    }
+
+    await startTask(loginType, chatId, taskId, newAbortController.signal);
+    if (isTaskRunning) {
+      isTaskRunning = false;
+      abortController = null;
+      currentTaskId = 0;
+    }
+    return;
+  }
+
+  if (text === '/cancel') {
+    if (!isTaskRunning || !abortController) {
+      await sendToChat(chatId, '没有正在运行的任务。');
+      return;
+    }
+    abortController.abort();
+    if (currentBrowser) {
+      try {
+        if (await currentBrowser.isConnected()) {
+          await currentBrowser.close();
+        }
+      } catch (e) { /* 忽略 */ }
+      currentBrowser = null;
+    }
+    for (const [cid, resolve] of pendingReplies) {
+      pendingReplies.delete(cid);
+      if (replyTimeouts.has(cid)) {
+        clearTimeout(replyTimeouts.get(cid));
+        replyTimeouts.delete(cid);
+      }
+      resolve(null);
+    }
+    await sendToChat(chatId, `✅ 已发送取消信号给任务 ${currentTaskId}`);
+    return;
+  }
+
+  if (text === '/status') {
+    if (isTaskRunning) {
+      await sendToChat(chatId, `状态: 运行中 (任务 ${currentTaskId})`);
+    } else {
+      await sendToChat(chatId, '状态: 空闲');
+    }
+    await sendToChat(chatId, `尝试次数: ${currentTry}`);
+    return;
+  }
+
+  if (text === '/queue') {
+    try {
+      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      await sendToChat(chatId, `剩余资料: ${data.length}`);
+    } catch (e) {
+      await sendToChat(chatId, '读取队列失败');
+    }
+    return;
+  }
+});
+
+console.log('🤖 机器人已启动。单任务模式，安全可靠。');
+console.log(`无头模式: ${HEADLESS}`);
+console.log(`授权用户: ${ALLOWED_IDS.join(', ')}`);
+console.log('\n可用命令：');
+console.log('  /starttask - 启动实名任务');
+console.log('  /cancel   - 取消当前任务');
+console.log('  /status   - 查看任务状态');
+console.log('  /queue    - 查看剩余资料数量');
+console.log('  /list     - 查看资料列表');
+console.log('  /add 姓名 身份证 - 添加资料');
+console.log('  /del 序号 - 删除指定资料');
+console.log('  任务中: 点击按钮即可操作（c/n/q/r/y）');
