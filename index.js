@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// bot.js - 完整版，含人工审核失败截图+重试
+// bot.js - 带内联键盘，点击即可回复
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -34,7 +34,8 @@ let taskIdCounter = 0;
 let abortController = null;
 let currentBrowser = null;
 let currentTry = 0;
-const pendingReplies = new Map();
+const pendingReplies = new Map(); // chatId -> resolve function
+const replyTimeouts = new Map();  // chatId -> timer
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
@@ -48,7 +49,7 @@ function atomicWriteFile(filePath, data) {
 }
 
 function maskId(id) {
-  return id;  // 显示完整身份证号
+  return id;
 }
 
 async function sendToChat(chatId, content, options = {}) {
@@ -85,25 +86,96 @@ async function broadcastPhoto(filePath, options = {}) {
   }
 }
 
+// ========== 内联键盘创建函数 ==========
+function createInlineKeyboard(buttons, columns = 2) {
+  const keyboard = [];
+  let row = [];
+  for (let i = 0; i < buttons.length; i++) {
+    row.push(buttons[i]);
+    if ((i + 1) % columns === 0 || i === buttons.length - 1) {
+      keyboard.push(row);
+      row = [];
+    }
+  }
+  return { reply_markup: { inline_keyboard: keyboard } };
+}
+
+// 登录方式选择键盘
+function loginKeyboard() {
+  return createInlineKeyboard([
+    { text: '📱 微信', callback_data: 'login_1' },
+    { text: '💬 QQ', callback_data: 'login_2' }
+  ]);
+}
+
+// 通用选择键盘：继续 / 下一条 / 退出
+function continueKeyboard() {
+  return createInlineKeyboard([
+    { text: '🔄 继续 (c)', callback_data: 'choice_c' },
+    { text: '⏭️ 下一条 (n)', callback_data: 'choice_n' },
+    { text: '🚪 退出 (q)', callback_data: 'choice_q' }
+  ]);
+}
+
+// 人工审核失败键盘：重试 / 下一条 / 退出
+function retryKeyboard() {
+  return createInlineKeyboard([
+    { text: '🔄 重试 (r)', callback_data: 'choice_r' },
+    { text: '⏭️ 下一条 (n)', callback_data: 'choice_n' },
+    { text: '🚪 退出 (q)', callback_data: 'choice_q' }
+  ]);
+}
+
+// 不确定状态键盘：成功 / 失败 / 审核中
+function unknownKeyboard() {
+  return createInlineKeyboard([
+    { text: '✅ 成功 (y)', callback_data: 'choice_y' },
+    { text: '❌ 失败 (n)', callback_data: 'choice_n' },
+    { text: '⏳ 审核中 (r)', callback_data: 'choice_r' }
+  ]);
+}
+
+// 连续失败键盘：继续 / 退出
+function failKeyboard() {
+  return createInlineKeyboard([
+    { text: '🔄 继续 (y)', callback_data: 'choice_y' },
+    { text: '🚪 退出 (q)', callback_data: 'choice_q' }
+  ]);
+}
+
+// ========== 等待回复（支持内联键盘和文字输入） ==========
 function waitTelegramReply(chatId, abortSignal, timeoutSeconds = 120) {
   return new Promise((resolve) => {
-    let timer = null;
+    // 清除旧定时器
+    if (replyTimeouts.has(chatId)) {
+      clearTimeout(replyTimeouts.get(chatId));
+      replyTimeouts.delete(chatId);
+    }
+
     const onAbort = () => {
-      if (timer) clearTimeout(timer);
+      if (replyTimeouts.has(chatId)) {
+        clearTimeout(replyTimeouts.get(chatId));
+        replyTimeouts.delete(chatId);
+      }
       pendingReplies.delete(chatId);
       resolve(null);
     };
     abortSignal.addEventListener('abort', onAbort, { once: true });
 
-    timer = setTimeout(() => {
+    const timer = setTimeout(() => {
       abortSignal.removeEventListener('abort', onAbort);
       pendingReplies.delete(chatId);
+      replyTimeouts.delete(chatId);
       sendToChat(chatId, '⏰ 回复超时，任务将退出。');
       resolve(null);
     }, timeoutSeconds * 1000);
+    replyTimeouts.set(chatId, timer);
 
     const wrappedResolve = (value) => {
-      if (timer) clearTimeout(timer);
+      if (replyTimeouts.has(chatId)) {
+        clearTimeout(replyTimeouts.get(chatId));
+        replyTimeouts.delete(chatId);
+      }
       abortSignal.removeEventListener('abort', onAbort);
       pendingReplies.delete(chatId);
       resolve(value);
@@ -165,38 +237,27 @@ async function handleManualReview(page, taskId, realName, idCard, chatId) {
   return true;
 }
 
-// ========== 新增：处理人工审核失败（需人工介入） ==========
 async function handleManualFailure(page, taskId, realName, idCard, chatId, reason) {
   console.log(`⚠️ 任务 ${taskId}: 人工审核失败 - ${reason}`);
   const screenshotPath = path.join(__dirname, `manual_failure_${taskId}_${Date.now()}.png`);
   await page.screenshot({ path: screenshotPath, fullPage: true });
   
   await sendPhotoToChat(chatId, screenshotPath, { 
-    caption: `⚠️ 【人工审核失败】\n姓名：${realName}\n身份证：${maskId(idCard)}\n失败原因：${reason}\n\n请回复 r 重试（点击实名认证按钮） / n 下一条 / q 退出`
+    caption: `⚠️ 【人工审核失败】\n姓名：${realName}\n身份证：${maskId(idCard)}\n失败原因：${reason}` 
   });
   await broadcastPhoto(screenshotPath);
   await broadcastMessage(`⚠️ 人工审核失败\n姓名：${realName}\n身份证：${maskId(idCard)}\n原因：${reason}`);
   
-  // 等待用户决策（重试或跳过）
+  // 发送内联键盘
+  await sendToChat(chatId, '请选择操作：', retryKeyboard());
+  
   const ans = await waitTelegramReply(chatId, abortController.signal, 120);
   if (abortController?.signal?.aborted || ans === null) {
     return 'abort';
   }
-  if (ans === 'r') {
-    // 用户选择重试：点击“实名认证”按钮
-    return 'retry';
-  } else if (ans === 'n') {
-    return 'skip';
-  } else if (ans === 'q') {
-    return 'quit';
-  } else {
-    // 无效输入，提示后重新等待（递归处理？简单起见，返回 skip）
-    await sendToChat(chatId, '输入无效，默认跳过。');
-    return 'skip';
-  }
+  return ans;
 }
 
-// 处理普通失败（错误提示）
 async function handleFailure(page, taskId, realName, idCard, chatId, reason) {
   console.log(`❌ 任务 ${taskId}: 实名失败 - ${reason}`);
   const screenshotPath = path.join(__dirname, `failed_${taskId}_${Date.now()}.png`);
@@ -307,12 +368,10 @@ async function handlePopup(page) {
 
 async function checkVerificationStatus(page) {
   try {
-    // 1. 检查人工审核中
     if (await isUnderManualReview(page)) {
       return { result: 'review', reason: '人工审核中' };
     }
     
-    // 2. 检查人工审核失败（需人工介入）
     const manualFailKeywords = ['人工实名审核失败', '暂不支持', '护照以外证件', '重新提交护照'];
     let bodyText = await page.textContent('body').catch(() => '');
     for (const kw of manualFailKeywords) {
@@ -331,14 +390,12 @@ async function checkVerificationStatus(page) {
       }
     }
 
-    // 3. 检查输入框是否消失
     const inputsExist = await hasInputs(page);
     if (!inputsExist) {
       console.log('✅ 输入框已消失，判定为成功。');
       return { result: 'success', reason: '输入框消失' };
     }
 
-    // 4. 检查错误关键词
     const errorKeywords = ['系统繁忙', '网络异常', '错误', '重新登录', '失败', '请稍后再试'];
     bodyText = await page.textContent('body').catch(() => '');
     for (const kw of errorKeywords) {
@@ -357,7 +414,6 @@ async function checkVerificationStatus(page) {
       }
     }
 
-    // 5. 不确定
     console.log('⚠️ 状态不确定，等待人工确认。');
     return { result: 'unknown', reason: '无法自动判断' };
   } catch (e) {
@@ -521,7 +577,6 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
       console.log(`任务 ${taskId} 第 ${totalTry} 次尝试: ${realName}`);
 
       try {
-        // 获取输入框并填充
         let curNameInput = null, curIdInput = null;
         for (let retry = 0; retry < 5; retry++) {
           const inputs = await findInputsInAllFrames(page);
@@ -550,17 +605,14 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
         await submitBtn.click();
         await delay(5000);
 
-        // 截图保存结果
         const screenshotPath = path.join(__dirname, `result_${taskId}_${totalTry}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
         await sendPhotoToChat(chatId, screenshotPath, { caption: `任务 ${taskId} 执行结果` });
 
-        // 检查状态
         const status = await checkVerificationStatus(page);
 
         // ----- 处理各种结果 -----
         if (status.result === 'success') {
-          // 成功
           const oldSuccess = fs.existsSync(SUCCESS_FILE)
             ? fs.readFileSync(SUCCESS_FILE, 'utf8')
             : '';
@@ -573,7 +625,6 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           break;
           
         } else if (status.result === 'review') {
-          // 人工审核中
           await handleManualReview(page, taskId, realName, idCard, chatId);
           data.shift();
           atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
@@ -581,23 +632,20 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           break;
           
         } else if (status.result === 'manual_failure') {
-          // ========== 人工审核失败（需人工介入） ==========
           const action = await handleManualFailure(page, taskId, realName, idCard, chatId, status.reason);
-          if (action === 'abort' || action === 'quit') {
+          if (action === 'abort' || action === 'quit' || action === 'q') {
             normalCompletion = false;
             break;
-          } else if (action === 'skip') {
+          } else if (action === 'skip' || action === 'n') {
             data.shift();
             atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
             failCount++;
-            continue; // 处理下一条
-          } else if (action === 'retry') {
-            // 用户选择重试：点击“实名认证”按钮
+            continue;
+          } else if (action === 'retry' || action === 'r') {
             const retryBtn = await findButtonByText(page, '实名认证');
             if (retryBtn) {
               await retryBtn.click();
-              await delay(3000); // 等待页面刷新，可能回到填写表单
-              // 不删除当前资料，继续循环（重新填写提交）
+              await delay(3000);
               continue;
             } else {
               await sendToChat(chatId, '⚠️ 找不到“实名认证”按钮，跳过该资料。');
@@ -609,10 +657,9 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           }
           
         } else if (status.result === 'failed') {
-          // 普通失败
           await handleFailure(page, taskId, realName, idCard, chatId, status.reason);
           
-          await sendToChat(chatId, `⚠️ 实名失败。回复 c(继续) n(下一条) q(退出)`);
+          await sendToChat(chatId, '⚠️ 实名失败，请选择操作：', continueKeyboard());
           const ans = await waitTelegramReply(chatId, abortSignal, 120);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
           if (ans === 'q') { normalCompletion = false; return; }
@@ -625,8 +672,7 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           }
           
         } else { // unknown
-          // 不确定，人工判断
-          await sendToChat(chatId, '⚠️ 系统无法自动判断结果，请查看截图并回复 y(成功) / n(失败) / r(审核中)');
+          await sendToChat(chatId, '⚠️ 系统无法自动判断结果，请查看截图并选择：', unknownKeyboard());
           const ans = await waitTelegramReply(chatId, abortSignal, 60);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
           
@@ -648,10 +694,9 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
             failCount = 0;
             break;
           } else {
-            // 默认失败
             await handleFailure(page, taskId, realName, idCard, chatId, '人工判定为失败');
             
-            await sendToChat(chatId, '人工判定为失败。回复 c(继续) n(下一条) q(退出)');
+            await sendToChat(chatId, '人工判定为失败，请选择操作：', continueKeyboard());
             const ans2 = await waitTelegramReply(chatId, abortSignal, 120);
             if (abortSignal.aborted || ans2 === null) { normalCompletion = false; return; }
             if (ans2 === 'q') { normalCompletion = false; return; }
@@ -665,9 +710,8 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
           }
         }
 
-        // 连续失败5次提示
         if (failCount >= 5) {
-          await sendToChat(chatId, '连续失败5次。y(继续) / q(退出)');
+          await sendToChat(chatId, '连续失败5次，请选择：', failKeyboard());
           const ans = await waitTelegramReply(chatId, abortSignal, 60);
           if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
           if (ans !== 'y') { normalCompletion = false; return; }
@@ -676,7 +720,7 @@ async function startTask(loginType, chatId, taskId, abortSignal) {
       } catch (err) {
         if (abortSignal.aborted) { normalCompletion = false; return; }
         console.error(`任务 ${taskId} 错误:`, err);
-        await sendToChat(chatId, `错误: ${err.message}\n回复 c(继续) n(下一条) q(退出)`);
+        await sendToChat(chatId, `错误: ${err.message}，请选择操作：`, continueKeyboard());
         const ans = await waitTelegramReply(chatId, abortSignal, 60);
         if (abortSignal.aborted || ans === null) { normalCompletion = false; return; }
         if (ans === 'q') { normalCompletion = false; return; }
@@ -724,6 +768,53 @@ process.on('unhandledRejection', async (reason) => {
   process.exit(1);
 });
 
+// ========== 内联键盘回调处理 ==========
+bot.on('callback_query', async (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id.toString();
+  const data = callbackQuery.data;
+  
+  // 只处理授权用户
+  if (!ALLOWED_IDS.includes(chatId)) {
+    await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ 未授权' });
+    return;
+  }
+
+  // 处理登录选择
+  if (data.startsWith('login_')) {
+    const value = data.replace('login_', '');
+    await bot.answerCallbackQuery(callbackQuery.id);
+    // 清除原有回复等待
+    if (pendingReplies.has(chatId)) {
+      const resolve = pendingReplies.get(chatId);
+      pendingReplies.delete(chatId);
+      if (replyTimeouts.has(chatId)) {
+        clearTimeout(replyTimeouts.get(chatId));
+        replyTimeouts.delete(chatId);
+      }
+      resolve(value);
+    }
+    return;
+  }
+
+  // 处理选择回复 (c/n/q/r/y)
+  if (data.startsWith('choice_')) {
+    const value = data.replace('choice_', '');
+    await bot.answerCallbackQuery(callbackQuery.id);
+    if (pendingReplies.has(chatId)) {
+      const resolve = pendingReplies.get(chatId);
+      pendingReplies.delete(chatId);
+      if (replyTimeouts.has(chatId)) {
+        clearTimeout(replyTimeouts.get(chatId));
+        replyTimeouts.delete(chatId);
+      }
+      resolve(value);
+    }
+    return;
+  }
+
+  await bot.answerCallbackQuery(callbackQuery.id);
+});
+
 // ========== Telegram 消息处理 ==========
 bot.on('message', async (msg) => {
   if (!msg.text) return;
@@ -735,17 +826,21 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // 处理文字回复（兼容内联键盘和文字输入）
   if (!text.startsWith('/')) {
     if (pendingReplies.has(chatId)) {
       const resolve = pendingReplies.get(chatId);
       pendingReplies.delete(chatId);
+      if (replyTimeouts.has(chatId)) {
+        clearTimeout(replyTimeouts.get(chatId));
+        replyTimeouts.delete(chatId);
+      }
       resolve(text.toLowerCase());
       return;
     }
   }
 
   // ---------- 命令处理 ----------
-  // /add
   if (text.startsWith('/add ')) {
     if (isTaskRunning) {
       await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再添加。');
@@ -760,190 +855,4 @@ bot.on('message', async (msg) => {
       const name = parts[1];
       const idCard = parts.slice(2).join('');
       if (!/^\d{17}[\dXx]$/.test(idCard)) {
-        await sendToChat(chatId, '⚠️ 身份证号格式错误，请输入18位数字（最后一位可为X）');
-        return;
-      }
-
-      let data = [];
-      if (fs.existsSync(DATA_FILE)) {
-        try {
-          data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        } catch (e) {
-          data = [];
-        }
-      }
-
-      const exists = data.some(item => item.id === idCard);
-      if (exists) {
-        await sendToChat(chatId, `⚠️ 身份证号 ${maskId(idCard)} 已存在，请勿重复添加。`);
-        return;
-      }
-
-      data.push({ name: name, id: idCard });
-      atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
-
-      await sendToChat(chatId, `✅ 已添加资料\n姓名：${name}\n身份证：${maskId(idCard)}\n当前队列共 ${data.length} 条`);
-    } catch (e) {
-      console.error('添加资料失败:', e);
-      await sendToChat(chatId, `❌ 添加失败: ${e.message}`);
-    }
-    return;
-  }
-
-  // /list
-  if (text === '/list' || text.startsWith('/list ')) {
-    try {
-      let page = 1;
-      const parts = text.split(' ');
-      if (parts.length > 1 && /^\d+$/.test(parts[1])) page = parseInt(parts[1]);
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      if (data.length === 0) { await sendToChat(chatId, '📭 队列为空'); return; }
-      const pageSize = 10;
-      const totalPages = Math.ceil(data.length / pageSize);
-      if (page > totalPages) page = totalPages;
-      const start = (page - 1) * pageSize;
-      const end = Math.min(start + pageSize, data.length);
-      let message = `📋 资料列表 (第 ${page}/${totalPages} 页，共 ${data.length} 条)\n━━━━━━━━━━━━━━━\n`;
-      for (let i = start; i < end; i++) {
-        const item = data[i];
-        const maskedId = maskId(item.id);
-        message += `【${i+1}】${item.name} | ${maskedId}\n`;
-      }
-      message += `━━━━━━━━━━━━━━━\n💡 使用 /add 姓名 身份证 添加资料\n💡 使用 /del 序号 删除资料`;
-      await sendToChat(chatId, message);
-    } catch (e) {
-      await sendToChat(chatId, `❌ 读取资料失败: ${e.message}`);
-    }
-    return;
-  }
-
-  // /del
-  if (text.startsWith('/del ')) {
-    if (isTaskRunning) {
-      await sendToChat(chatId, '⚠️ 任务正在运行，请先 /cancel 再删除。');
-      return;
-    }
-    try {
-      const parts = text.split(' ');
-      if (parts.length < 2 || !/^\d+$/.test(parts[1])) {
-        await sendToChat(chatId, '⚠️ 请输入有效数字，例如 /del 5');
-        return;
-      }
-      const index = parseInt(parts[1]) - 1;
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      if (index < 0 || index >= data.length) {
-        await sendToChat(chatId, `❌ 序号无效，共有 ${data.length} 条资料。`);
-        return;
-      }
-      const deleted = data[index];
-      data.splice(index, 1);
-      atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
-      const maskedId = maskId(deleted.id);
-      await sendToChat(chatId, `✅ 已删除: ${deleted.name} | ${maskedId}\n剩余: ${data.length} 条`);
-    } catch (e) {
-      await sendToChat(chatId, `❌ 删除失败: ${e.message}`);
-    }
-    return;
-  }
-
-  // /starttask
-  if (text === '/starttask') {
-    if (isTaskRunning) {
-      await sendToChat(chatId, `⚠️ 任务 (ID ${currentTaskId}) 正在运行，请先 /cancel。`);
-      return;
-    }
-
-    currentTry = 0;
-
-    const taskId = ++taskIdCounter;
-    currentTaskId = taskId;
-    const newAbortController = new AbortController();
-    abortController = newAbortController;
-    isTaskRunning = true;
-
-    await sendToChat(chatId, `启动任务 ${taskId}\n/cancel 停止\n/status 状态\n/queue 剩余\n/list 列表\n/add 添加\n/del 删除\n\n任务中: c=继续, n=下一条, q=退出, r=重试`);
-    await sendToChat(chatId, '请选择登录方式:\n1 = 微信\n2 = QQ');
-
-    let loginType = null;
-    while (loginType === null) {
-      const reply = await waitTelegramReply(chatId, newAbortController.signal, 60);
-      if (newAbortController.signal.aborted || reply === null) {
-        isTaskRunning = false;
-        abortController = null;
-        currentTaskId = 0;
-        return;
-      }
-      if (reply === '1' || reply === '2') {
-        loginType = reply;
-      } else {
-        await sendToChat(chatId, '输入无效，请输入 1(微信) 或 2(QQ)：');
-      }
-    }
-
-    await startTask(loginType, chatId, taskId, newAbortController.signal);
-    if (isTaskRunning) {
-      isTaskRunning = false;
-      abortController = null;
-      currentTaskId = 0;
-    }
-    return;
-  }
-
-  // /cancel
-  if (text === '/cancel') {
-    if (!isTaskRunning || !abortController) {
-      await sendToChat(chatId, '没有正在运行的任务。');
-      return;
-    }
-    abortController.abort();
-    if (currentBrowser) {
-      try {
-        if (await currentBrowser.isConnected()) {
-          await currentBrowser.close();
-        }
-      } catch (e) { /* 忽略 */ }
-      currentBrowser = null;
-    }
-    for (const [cid, resolve] of pendingReplies) {
-      pendingReplies.delete(cid);
-      resolve(null);
-    }
-    await sendToChat(chatId, `✅ 已发送取消信号给任务 ${currentTaskId}`);
-    return;
-  }
-
-  // /status
-  if (text === '/status') {
-    if (isTaskRunning) {
-      await sendToChat(chatId, `状态: 运行中 (任务 ${currentTaskId})`);
-    } else {
-      await sendToChat(chatId, '状态: 空闲');
-    }
-    await sendToChat(chatId, `尝试次数: ${currentTry}`);
-    return;
-  }
-
-  // /queue
-  if (text === '/queue') {
-    try {
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      await sendToChat(chatId, `剩余资料: ${data.length}`);
-    } catch (e) {
-      await sendToChat(chatId, '读取队列失败');
-    }
-    return;
-  }
-});
-
-console.log('🤖 机器人已启动。单任务模式，安全可靠。');
-console.log(`无头模式: ${HEADLESS}`);
-console.log(`授权用户: ${ALLOWED_IDS.join(', ')}`);
-console.log('\n可用命令：');
-console.log('  /starttask - 启动实名任务');
-console.log('  /cancel   - 取消当前任务');
-console.log('  /status   - 查看任务状态');
-console.log('  /queue    - 查看剩余资料数量');
-console.log('  /list     - 查看资料列表');
-console.log('  /add 姓名 身份证 - 添加资料');
-console.log('  /del 序号 - 删除指定资料');
-console.log('  任务中: c=继续, n=下一条, q=退出, r=重试');
+        await send
